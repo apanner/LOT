@@ -57,41 +57,124 @@ def _task_embedding(device: torch.device) -> torch.Tensor:
 
 def _load_rgb_frame(path: str) -> np.ndarray:
     img = cv2.imread(path)
-    if img is None:
-        raise FileNotFoundError(path)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img is not None:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return np.array(im.convert("RGB"))
+    except Exception as exc:
+        raise FileNotFoundError(path) from exc
 
 
-def _read_frame_from_pattern(pattern: str, frame_num: int, padding: int) -> np.ndarray:
-    frame_path = re.sub(
+def _build_frame_path_from_pattern(pattern: str, frame_num: int) -> str:
+    return re.sub(
         r"%0?(\d+)d",
         lambda m: f"{frame_num:0{int(m.group(1))}d}",
         pattern,
     )
-    if os.path.exists(frame_path):
-        return _load_rgb_frame(frame_path)
+
+
+def _discover_frame_numbers(pattern: str) -> List[int]:
+    """List frame indices by scanning the pattern's directory (handles gaps / wrong batch range)."""
+    directory = os.path.dirname(pattern) or "."
+    basename = os.path.basename(pattern)
+    m = re.search(r"%0(\d+)d", basename)
+    if not m:
+        m = re.search(r"%(\d+)d", basename)
+    if not m:
+        return []
+    token = m.group(0)
+    prefix, suffix = basename.split(token, 1)
+    if suffix is None:
+        return []
+    rx = re.compile("^" + re.escape(prefix) + r"(\d+)" + re.escape(suffix) + "$", re.IGNORECASE)
+    try:
+        names = os.listdir(directory)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    nums: List[int] = []
+    for name in names:
+        mm = rx.match(name)
+        if mm:
+            nums.append(int(mm.group(1)))
+    return sorted(set(nums))
+
+
+def _resolve_frame_numbers(pattern: str, first: int, last: int) -> List[int]:
+    """
+    Build the list of frames to process. Uses dense [first, last] when every file exists; otherwise
+    falls back to listing the folder so JPG/PNG plates work with missing frames, Drive sync gaps,
+    or batch JSON that does not match on-disk numbering.
+    """
+    dense = list(range(first, last + 1))
+    existing = [n for n in dense if os.path.exists(_build_frame_path_from_pattern(pattern, n))]
+    if len(existing) == len(dense):
+        return dense
+    if existing:
+        missing = len(dense) - len(existing)
+        print(
+            f"[LOTUS] Warning: {missing} missing file(s) in range [{first},{last}]; "
+            f"processing {len(existing)} existing frame(s)."
+        )
+        return existing
+    discovered = _discover_frame_numbers(pattern)
+    if not discovered:
+        sample = _build_frame_path_from_pattern(pattern, first)
+        raise FileNotFoundError(
+            f"No input frames found for pattern {pattern!r} (tried {sample!r} and directory listing)."
+        )
+    in_range = [n for n in discovered if first <= n <= last]
+    if in_range:
+        if len(in_range) != len(dense):
+            print(
+                f"[LOTUS] Warning: batch range [{first},{last}] has {len(dense)} steps but only "
+                f"{len(in_range)} files on disk; processing those."
+            )
+        return in_range
+    print(
+        f"[LOTUS] Warning: no frames in [{first},{last}] on disk; using {len(discovered)} files "
+        f"actually present ({discovered[0]}–{discovered[-1]})."
+    )
+    return discovered
+
+
+def _read_frame_from_pattern(pattern: str, frame_num: int, padding: int) -> np.ndarray:
+    frame_path = _build_frame_path_from_pattern(pattern, frame_num)
     lower = frame_path.lower()
     if lower.endswith(".exr"):
+        if not os.path.exists(frame_path):
+            raise FileNotFoundError(frame_path)
         try:
-            import OpenEXR
             import Imath
+            import OpenEXR
         except ImportError:
-            raise RuntimeError("EXR input requires OpenEXR. Enable create_jpg in app or install OpenEXR.") from None
+            raise RuntimeError(
+                "EXR input requires OpenEXR. Install OpenEXR or use JPEG/PNG plates."
+            ) from None
         exr = OpenEXR.InputFile(frame_path)
         dw = exr.header()["dataWindow"]
         w = dw.max.x - dw.min.x + 1
         h = dw.max.y - dw.min.y + 1
         channels = list(exr.header()["channels"].keys())
-        ch0 = channels[0]
+        ch0 = "R" if "R" in channels else channels[0]
         extype = Imath.PixelType(Imath.PixelType.FLOAT)
-        raw = np.frombuffer(exr.channel(ch0, extype), dtype=np.float32).reshape((h, w))
-        rgb = np.stack([raw, raw, raw], axis=-1)
+        r = np.frombuffer(exr.channel(ch0, extype), dtype=np.float32).reshape((h, w))
+        if "G" in channels and "B" in channels:
+            g = np.frombuffer(exr.channel("G", extype), dtype=np.float32).reshape((h, w))
+            b = np.frombuffer(exr.channel("B", extype), dtype=np.float32).reshape((h, w))
+            rgb = np.stack([r, g, b], axis=-1)
+        else:
+            rgb = np.stack([r, r, r], axis=-1)
         rgb = np.clip(rgb, 0.0, None)
         mx = float(rgb.max()) if rgb.size else 1.0
         if mx > 1.0:
             rgb = rgb / (mx + 1e-8)
         return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
-    raise FileNotFoundError(frame_path)
+    if not os.path.exists(frame_path):
+        raise FileNotFoundError(frame_path)
+    return _load_rgb_frame(frame_path)
 
 
 def _save_depth_exr(path: str, depth_hw: np.ndarray, floating_point: str = "float32") -> None:
@@ -431,7 +514,8 @@ class LOTUSDepthNormalEngine:
         depth_count = 0
         norm_count = 0
 
-        for frame_num in tqdm(range(first, last + 1), desc="LOTUS frames"):
+        frame_numbers = _resolve_frame_numbers(pattern, first, last)
+        for frame_num in tqdm(frame_numbers, desc="LOTUS frames"):
             rgb = _read_frame_from_pattern(pattern, frame_num, pad)
             backward_flow = None
             temporal_weight = None
