@@ -230,8 +230,10 @@ def _resize_rgb_for_raft(rgb: np.ndarray, max_side: int) -> tuple[torch.Tensor, 
 class LOTUSDepthNormalEngine:
     """Load Lotus-D pipelines and run a frame range from an image sequence pattern."""
 
-    def __init__(self, lotus_root: Optional[str] = None):
-        self.lotus_root = Path(lotus_root) if lotus_root else None
+    def __init__(self, lotus_root: Optional[str] = None, lot_root: Optional[str] = None):
+        # `lot_root` is accepted for older Colab cellcode compatibility.
+        root = lotus_root if lotus_root is not None else lot_root
+        self.lotus_root = Path(root) if root else None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._pipe_depth = None
         self._pipe_normal = None
