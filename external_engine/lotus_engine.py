@@ -409,6 +409,7 @@ class LOTUSDepthNormalEngine:
         ema = float(job_data.get("lotus_temporal_ema", 0.35))
         temporal_mode = str(job_data.get("lotus_temporal_mode", "ema")).lower()
         use_raft = stabilize and temporal_mode == "raft"
+        raft_failed = False
         raft_backend = str(job_data.get("raft_backend", "raft_small"))
         raft_max_side = int(job_data.get("raft_inference_resolution", 520))
         raft_updates = int(job_data.get("raft_num_flow_updates", 12))
@@ -434,16 +435,23 @@ class LOTUSDepthNormalEngine:
             rgb = _read_frame_from_pattern(pattern, frame_num, pad)
             backward_flow = None
             temporal_weight = None
-            if use_raft and (gen_depth or gen_norm):
-                backward_flow, temporal_weight = self._raft_temporal_weight(
-                    prev_rgb,
-                    rgb,
-                    raft_backend,
-                    raft_max_side,
-                    raft_updates,
-                    raft_threshold,
-                    raft_alpha,
-                )
+            if use_raft and not raft_failed and (gen_depth or gen_norm):
+                try:
+                    backward_flow, temporal_weight = self._raft_temporal_weight(
+                        prev_rgb,
+                        rgb,
+                        raft_backend,
+                        raft_max_side,
+                        raft_updates,
+                        raft_threshold,
+                        raft_alpha,
+                    )
+                except Exception as exc:
+                    raft_failed = True
+                    print(
+                        "[WARN] RAFT temporal smoothing failed; falling back to normal EMA temporal. "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if gen_depth and self._pipe_depth is not None:
                 pred = self._run_frame(
                     self._pipe_depth,
