@@ -11,11 +11,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from contextlib import nullcontext
+
 import cv2
 import numpy as np
 import torch
-from contextlib import nullcontext
-from PIL import Image
+import torch.nn.functional as F
 from tqdm import tqdm
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -23,6 +24,29 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 # HF model ids (Lotus-D regression, same family as LOT/app.py defaults)
 DEFAULT_DEPTH_MODEL_D = "jingheya/lotus-depth-d-v2-0-disparity"
 DEFAULT_NORMAL_MODEL_D = "jingheya/lotus-normal-d-v1-0"
+
+
+def _resolve_auto_processing_res(processing_res: Optional[int]) -> Optional[int]:
+    """-1 means choose the highest quality setting this GPU is likely to handle."""
+    if processing_res != -1:
+        return processing_res
+    if not torch.cuda.is_available():
+        print("[LOTUS] Auto quality: CUDA unavailable, using 768 processing resolution")
+        return 768
+    props = torch.cuda.get_device_properties(0)
+    vram_gb = props.total_memory / (1024 ** 3)
+    if vram_gb >= 40.0:
+        chosen = 0  # Native LOTUS processing; outputs still match input res.
+    elif vram_gb >= 24.0:
+        chosen = 2048
+    elif vram_gb >= 16.0:
+        chosen = 1536
+    elif vram_gb >= 10.0:
+        chosen = 1024
+    else:
+        chosen = 768
+    print(f"[LOTUS] Auto quality: GPU VRAM {vram_gb:.1f} GB -> processing_res={chosen}")
+    return chosen
 
 
 def _task_embedding(device: torch.device) -> torch.Tensor:
@@ -123,6 +147,86 @@ def _stabilize_normal(
     return np.clip((v + 1.0) * 0.5, 0.0, 1.0)
 
 
+def _normalize_normal01(normal01: np.ndarray) -> np.ndarray:
+    v = normal01.astype(np.float32) * 2.0 - 1.0
+    mag = np.linalg.norm(v, axis=-1, keepdims=True)
+    v = v / np.maximum(mag, 1e-8)
+    return np.clip((v + 1.0) * 0.5, 0.0, 1.0)
+
+
+def _warp_scalar_backward(prev_hw: np.ndarray, backward_flow: np.ndarray) -> np.ndarray:
+    """Warp previous scalar frame into current coordinates using current -> previous flow."""
+    assert prev_hw.ndim == 2
+    assert backward_flow.shape[0] == 2
+    h, w = prev_hw.shape
+    prev_t = torch.from_numpy(prev_hw.astype(np.float32, copy=False))[None, None]
+    flow_t = torch.from_numpy(backward_flow.astype(np.float32, copy=False))
+    y_coords = torch.arange(h, dtype=torch.float32)
+    x_coords = torch.arange(w, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    src_x = xx + flow_t[0]
+    src_y = yy + flow_t[1]
+    grid = torch.stack(
+        [
+            src_x / max(w - 1, 1) * 2.0 - 1.0,
+            src_y / max(h - 1, 1) * 2.0 - 1.0,
+        ],
+        dim=-1,
+    )[None]
+    warped = F.grid_sample(prev_t, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    return warped[0, 0].numpy().astype(np.float32, copy=False)
+
+
+def _warp_rgb_backward(prev_hwc: np.ndarray, backward_flow: np.ndarray) -> np.ndarray:
+    chans = [
+        _warp_scalar_backward(prev_hwc[..., idx], backward_flow)
+        for idx in range(prev_hwc.shape[-1])
+    ]
+    return np.stack(chans, axis=-1).astype(np.float32, copy=False)
+
+
+def _fb_occlusion_mask(
+    forward_prev: np.ndarray,
+    backward_cur: np.ndarray,
+    threshold_px: float,
+) -> np.ndarray:
+    """Return [0,1] occlusion mask in current-frame coords; 1 rejects smoothing."""
+    assert forward_prev.shape == backward_cur.shape
+    h, w = backward_cur.shape[1:]
+    fp = torch.from_numpy(forward_prev.astype(np.float32, copy=False))[None]
+    bc = torch.from_numpy(backward_cur.astype(np.float32, copy=False))[None]
+    y_coords = torch.arange(h, dtype=torch.float32)
+    x_coords = torch.arange(w, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+    src_x = xx + bc[0, 0]
+    src_y = yy + bc[0, 1]
+    grid = torch.stack(
+        [
+            src_x / max(w - 1, 1) * 2.0 - 1.0,
+            src_y / max(h - 1, 1) * 2.0 - 1.0,
+        ],
+        dim=-1,
+    )[None]
+    fwd_at_src = F.grid_sample(fp, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    residual = bc + fwd_at_src
+    err = torch.sqrt(residual[0, 0] ** 2 + residual[0, 1] ** 2)
+    return torch.clamp(err / max(float(threshold_px), 1e-6), 0.0, 1.0).numpy().astype(np.float32)
+
+
+def _resize_rgb_for_raft(rgb: np.ndarray, max_side: int) -> tuple[torch.Tensor, float, float]:
+    h, w = rgb.shape[:2]
+    if max_side and max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+    else:
+        scale = 1.0
+    rh = max(8, int(round(h * scale / 8.0)) * 8)
+    rw = max(8, int(round(w * scale / 8.0)) * 8)
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).float()[None] / 255.0
+    if (rh, rw) != (h, w):
+        tensor = F.interpolate(tensor, size=(rh, rw), mode="bilinear", align_corners=False)
+    return tensor, w / float(rw), h / float(rh)
+
+
 class LOTUSDepthNormalEngine:
     """Load Lotus-D pipelines and run a frame range from an image sequence pattern."""
 
@@ -131,6 +235,8 @@ class LOTUSDepthNormalEngine:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._pipe_depth = None
         self._pipe_normal = None
+        self._raft_model = None
+        self._raft_transforms = None
 
     def _ensure_lotus_imports(self) -> None:
         if self.lotus_root and str(self.lotus_root) not in sys.path:
@@ -195,6 +301,81 @@ class LOTUSDepthNormalEngine:
                 ).images[0]
         return pred
 
+    def _load_raft(self, backend: str = "raft_small") -> None:
+        if self._raft_model is not None:
+            return
+        from torchvision.models.optical_flow import (
+            Raft_Large_Weights,
+            Raft_Small_Weights,
+            raft_large,
+            raft_small,
+        )
+
+        if backend == "raft_large":
+            weights = Raft_Large_Weights.DEFAULT
+            model = raft_large(weights=weights, progress=False)
+        elif backend == "raft_small":
+            weights = Raft_Small_Weights.DEFAULT
+            model = raft_small(weights=weights, progress=False)
+        else:
+            raise ValueError(f"Unknown RAFT backend: {backend!r}")
+        self._raft_transforms = weights.transforms()
+        self._raft_model = model.to(self.device).eval()
+
+    def _compute_raft_flow(
+        self,
+        source_rgb: np.ndarray,
+        target_rgb: np.ndarray,
+        backend: str,
+        max_side: int,
+        num_flow_updates: int,
+    ) -> np.ndarray:
+        """Compute optical flow source -> target in original-resolution pixels."""
+        self._load_raft(backend)
+        src, sx, sy = _resize_rgb_for_raft(source_rgb, max_side)
+        tgt, _, _ = _resize_rgb_for_raft(target_rgb, max_side)
+        src, tgt = self._raft_transforms(src, tgt)
+        src = src.to(self.device)
+        tgt = tgt.to(self.device)
+        with torch.no_grad():
+            preds = self._raft_model(src, tgt, num_flow_updates=int(num_flow_updates))
+        flow = preds[-1]
+        h, w = source_rgb.shape[:2]
+        flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)[0]
+        flow[0] *= sx
+        flow[1] *= sy
+        return flow.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    def _raft_temporal_weight(
+        self,
+        prev_rgb: Optional[np.ndarray],
+        curr_rgb: np.ndarray,
+        backend: str,
+        max_side: int,
+        num_flow_updates: int,
+        fb_threshold_px: float,
+        alpha: float,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if prev_rgb is None or alpha <= 0.0:
+            return None, None
+        backward_cur = self._compute_raft_flow(
+            curr_rgb,
+            prev_rgb,
+            backend,
+            max_side,
+            num_flow_updates,
+        )
+        forward_prev = self._compute_raft_flow(
+            prev_rgb,
+            curr_rgb,
+            backend,
+            max_side,
+            num_flow_updates,
+        )
+        occlusion = _fb_occlusion_mask(forward_prev, backward_cur, fb_threshold_px)
+        weight = (1.0 - occlusion) * float(alpha)
+        return backward_cur, np.clip(weight, 0.0, 1.0).astype(np.float32)
+
     def process_sequence(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
         pattern = job_data["input_video"]
         first = int(job_data["first_frame"])
@@ -212,6 +393,7 @@ class LOTUSDepthNormalEngine:
         processing_res = job_data.get("lotus_processing_res")
         if processing_res is not None:
             processing_res = int(processing_res)
+        processing_res = _resolve_auto_processing_res(processing_res)
         match_input_res = True
         timestep = int(job_data.get("timestep", 999))
         seed = job_data.get("lotus_seed")
@@ -223,6 +405,13 @@ class LOTUSDepthNormalEngine:
         disparity_vis = bool(job_data.get("lotus_depth_disparity_vis", True))
         stabilize = bool(job_data.get("lotus_temporal_stabilization", True))
         ema = float(job_data.get("lotus_temporal_ema", 0.35))
+        temporal_mode = str(job_data.get("lotus_temporal_mode", "ema")).lower()
+        use_raft = stabilize and temporal_mode == "raft"
+        raft_backend = str(job_data.get("raft_backend", "raft_small"))
+        raft_max_side = int(job_data.get("raft_inference_resolution", 520))
+        raft_updates = int(job_data.get("raft_num_flow_updates", 12))
+        raft_threshold = float(job_data.get("raft_fb_threshold_px", 1.0))
+        raft_alpha = float(job_data.get("raft_alpha", ema))
 
         from utils.image_utils import colorize_depth_map
 
@@ -235,11 +424,24 @@ class LOTUSDepthNormalEngine:
 
         prev_d: Optional[np.ndarray] = None
         prev_n: Optional[np.ndarray] = None
+        prev_rgb: Optional[np.ndarray] = None
         depth_count = 0
         norm_count = 0
 
         for frame_num in tqdm(range(first, last + 1), desc="LOTUS frames"):
             rgb = _read_frame_from_pattern(pattern, frame_num, pad)
+            backward_flow = None
+            temporal_weight = None
+            if use_raft and (gen_depth or gen_norm):
+                backward_flow, temporal_weight = self._raft_temporal_weight(
+                    prev_rgb,
+                    rgb,
+                    raft_backend,
+                    raft_max_side,
+                    raft_updates,
+                    raft_threshold,
+                    raft_alpha,
+                )
             if gen_depth and self._pipe_depth is not None:
                 pred = self._run_frame(
                     self._pipe_depth,
@@ -251,7 +453,11 @@ class LOTUSDepthNormalEngine:
                 )
                 dep = np.asarray(pred.mean(axis=-1), dtype=np.float32)
                 if stabilize:
-                    dep = _stabilize_depth(prev_d, dep, ema)
+                    if use_raft and prev_d is not None and backward_flow is not None and temporal_weight is not None:
+                        warped = _warp_scalar_backward(prev_d, backward_flow)
+                        dep = temporal_weight * warped + (1.0 - temporal_weight) * dep
+                    else:
+                        dep = _stabilize_depth(prev_d, dep, ema)
                     prev_d = dep
                 exr_path = os.path.join(depth_exr_dir, f"lotus_depth.{frame_num:04d}.exr")
                 _save_depth_exr(exr_path, dep, floating_point)
@@ -269,12 +475,18 @@ class LOTUSDepthNormalEngine:
                 )
                 n01 = np.clip(pred.astype(np.float32), 0.0, 1.0)
                 if stabilize:
-                    n01 = _stabilize_normal(prev_n, n01, ema)
+                    if use_raft and prev_n is not None and backward_flow is not None and temporal_weight is not None:
+                        warped = _warp_rgb_backward(prev_n, backward_flow)
+                        n01 = temporal_weight[..., None] * warped + (1.0 - temporal_weight[..., None]) * n01
+                        n01 = _normalize_normal01(n01)
+                    else:
+                        n01 = _stabilize_normal(prev_n, n01, ema)
                     prev_n = n01
                 exr_path = os.path.join(norm_exr_dir, f"normal.{frame_num:04d}.exr")
                 _save_normal_exr(exr_path, n01, normal_range)
                 norm_count += 1
                 norm_vis_frames.append((n01 * 255.0).astype(np.uint8))
+            prev_rgb = rgb
             torch.cuda.empty_cache()
 
         fps = float(job_data.get("fps", 24.0))
